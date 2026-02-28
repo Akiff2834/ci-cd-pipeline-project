@@ -1,0 +1,199 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Zero-Downtime CI/CD Pipeline — GitHub Actions
+# Stages: Lint → Test → Build → Push to ECR → Deploy (Blue/Green)
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: 🚀 Zero-Downtime CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPOSITORY: akif-cicd-pipeline
+  IMAGE_TAG: ${{ github.sha }}   # Unique tag per commit — no overwrites!
+
+jobs:
+  # ── JOB 1: Code Quality & Tests ──────────────────────────────────────────────
+  test:
+    name: 🧪 Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Lint with flake8
+        run: |
+          pip install flake8
+          # Fail on syntax errors, warn on style issues
+          flake8 app/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 app/ --count --max-complexity=10 --max-line-length=100 --statistics
+
+      - name: Run tests with pytest
+        run: |
+          pip install pytest-cov
+          pytest tests/ -v --cov=app --cov-report=term-missing --cov-fail-under=80
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: .coverage
+
+  # ── JOB 2: Build & Push Docker Image to ECR ──────────────────────────────────
+  build:
+    name: 🐳 Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: test                  # Only runs if tests PASS
+    if: github.ref == 'refs/heads/main'   # Only on main branch, not PRs
+
+    outputs:
+      image_uri: ${{ steps.build-image.outputs.image_uri }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker build \
+            --build-arg APP_VERSION=${{ github.sha }} \
+            --cache-from "$ECR_REGISTRY/$ECR_REPOSITORY:latest" \
+            -t "$IMAGE_URI" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" \
+            .
+          docker push "$IMAGE_URI"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "✅ Image pushed: $IMAGE_URI"
+
+  # ── JOB 3: Zero-Downtime Blue/Green Deployment ───────────────────────────────
+  deploy:
+    name: 🟢 Deploy (Blue/Green)
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment: production      # Requires manual approval in GitHub UI!
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy with Zero-Downtime (Blue/Green via SSH)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: IMAGE_TAG,ECR_REPOSITORY,AWS_REGION
+          script: |
+            # ── Variables ─────────────────────────────────────────────────
+            AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+            ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+            IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            NEW_CONTAINER="app-green"
+            OLD_CONTAINER="app-blue"
+            NEW_PORT=8001
+            LIVE_PORT=8000
+
+            # ── Step 1: Pull new image ────────────────────────────────────
+            echo "📥 Pulling new image: $IMAGE_URI"
+            aws ecr get-login-password --region $AWS_REGION | \
+              docker login --username AWS --password-stdin "$ECR_REGISTRY"
+            docker pull "$IMAGE_URI"
+
+            # ── Step 2: Start GREEN container on a different port ─────────
+            echo "🟢 Starting GREEN container..."
+            docker run -d \
+              --name "$NEW_CONTAINER" \
+              --restart unless-stopped \
+              -p $NEW_PORT:8000 \
+              -e APP_VERSION="$IMAGE_TAG" \
+              -e ENVIRONMENT="production" \
+              "$IMAGE_URI"
+
+            # ── Step 3: Health check — wait until GREEN is ready ──────────
+            echo "🔍 Waiting for GREEN to be healthy..."
+            for i in $(seq 1 12); do
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$NEW_PORT/health)
+              if [ "$STATUS" = "200" ]; then
+                echo "✅ GREEN is healthy after $((i * 5)) seconds!"
+                break
+              fi
+              if [ "$i" = "12" ]; then
+                echo "❌ GREEN failed health check! Rolling back..."
+                docker stop "$NEW_CONTAINER" && docker rm "$NEW_CONTAINER"
+                exit 1
+              fi
+              sleep 5
+            done
+
+            # ── Step 4: Switch traffic (zero-downtime) ────────────────────
+            echo "🔀 Switching traffic from BLUE → GREEN..."
+            # Remap port 8000 to the green container
+            docker stop "$OLD_CONTAINER" 2>/dev/null || true
+            docker rm   "$OLD_CONTAINER" 2>/dev/null || true
+            docker stop "$NEW_CONTAINER"
+            docker run -d \
+              --name "$OLD_CONTAINER" \
+              --restart unless-stopped \
+              -p $LIVE_PORT:8000 \
+              -e APP_VERSION="$IMAGE_TAG" \
+              -e ENVIRONMENT="production" \
+              "$IMAGE_URI"
+            docker stop "$NEW_CONTAINER" && docker rm "$NEW_CONTAINER"
+
+            # ── Step 5: Final health check on live port ───────────────────
+            sleep 3
+            FINAL=$(curl -s http://localhost:$LIVE_PORT/health | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['status'])")
+            if [ "$FINAL" = "healthy" ]; then
+              echo "🎉 DEPLOYMENT SUCCESSFUL! Version: $IMAGE_TAG"
+            else
+              echo "❌ Final health check failed!"
+              exit 1
+            fi
+
+            # ── Step 6: Cleanup old Docker images ─────────────────────────
+            docker image prune -f
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "✅ Deployment of ${{ env.IMAGE_TAG }} completed successfully!"
+          echo "🔗 App: http://${{ secrets.EC2_HOST }}:8000"
+
+      - name: Notify deployment failure
+        if: failure()
+        run: echo "❌ Deployment FAILED for ${{ env.IMAGE_TAG }} — check logs above!"
